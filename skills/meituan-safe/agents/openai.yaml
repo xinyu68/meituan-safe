@@ -1,0 +1,7 @@
+interface:
+  display_name: "美团安全助手"
+  short_description: "分开搜索美团到店美食、团购或外卖，并安全查询菜单与订单"
+  default_prompt: "Use $meituan-safe to search Meituan in-store restaurants, group-buying deals, or food-delivery restaurants as distinct result types."
+
+policy:
+  allow_implicit_invocation: true

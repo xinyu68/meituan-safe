@@ -1,0 +1,8 @@
+**/.runtime/
+**/__pycache__/
+.pytest_cache/
+.test-artifacts/
+*.py[cod]
+auth_meituan.json
+storage-state.json
+*.json.tmp

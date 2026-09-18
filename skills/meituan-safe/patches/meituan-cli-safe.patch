@@ -1,0 +1,701 @@
+warning: in the working copy of 'src/client/browser-http.test.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/client/browser-http.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/client/types.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/commands/waimai.test.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/commands/waimai.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/index.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/services/restaurant.test.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/services/restaurant.ts', LF will be replaced by CRLF the next time Git touches it
+diff --git a/package-lock.json b/package-lock.json
+index 7c75bc8..48e4c2c 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -2780,9 +2780,9 @@
+       "license": "MIT"
+     },
+     "node_modules/fast-uri": {
+-      "version": "3.1.0",
+-      "resolved": "https://registry.npmmirror.com/fast-uri/-/fast-uri-3.1.0.tgz",
+-      "integrity": "sha512-iPeeDKJSWf4IEOasVVrknXpaBV0IApz/gp7S2bb7Z4Lljbl2MGJRqInZiUrQwV16cpzw/D3S5j5Julj/gT52AA==",
++      "version": "3.1.8",
++      "resolved": "https://registry.npmjs.org/fast-uri/-/fast-uri-3.1.8.tgz",
++      "integrity": "sha512-GZMtZUTNRpOVIECoXwLNZS5xUGE+mVNbTB8h/7Rwh2TFWcBQiPzTgyZi05BF9UMZKkLJv8XBRJTlU7zg8+ZfMg==",
+       "funding": [
+         {
+           "type": "github",
+@@ -3021,9 +3021,9 @@
+       "license": "MIT"
+     },
+     "node_modules/glob/node_modules/brace-expansion": {
+-      "version": "1.1.12",
+-      "resolved": "https://registry.npmmirror.com/brace-expansion/-/brace-expansion-1.1.12.tgz",
+-      "integrity": "sha512-9T9UjW3r0UW5c1Q7GTwllptXwhvYmEzFhzMfZ9H7FQWt+uZePjZPjBP/W1ZEyZ1twGWom5/56TF4lPcqjnDHcg==",
++      "version": "1.1.21",
++      "resolved": "https://registry.npmjs.org/brace-expansion/-/brace-expansion-1.1.21.tgz",
++      "integrity": "sha512-9zeA+KLZNNzglF2TPKRQEDyx6Yby7daAkuy8MiPzpXPsYDWi/DRM8jmwUDxokQjYqBpv5DgPiwD4h4ZZSy1Ujw==",
+       "license": "MIT",
+       "dependencies": {
+         "balanced-match": "^1.0.0",
+diff --git a/src/client/browser-http.ts b/src/client/browser-http.ts
+index 7a0d05f..8b50e87 100644
+--- a/src/client/browser-http.ts
++++ b/src/client/browser-http.ts
+@@ -121,7 +121,15 @@ export function createBrowserClient(session: Session): ApiClient {
+               headers: hdrs,
+               body,
+             });
+-            return res.json();
++            const text = await res.text();
++            try {
++              return JSON.parse(text);
++            } catch {
++              const contentType = res.headers.get('content-type') || 'unknown';
++              throw new Error(
++                `Meituan returned non-JSON response (HTTP ${res.status}, ${contentType})`
++              );
++            }
+           },
+           { fetchUrl: url.toString(), fetchBody: opts?.body || null },
+         );
+diff --git a/src/client/types.ts b/src/client/types.ts
+index 1126bb5..fd0a009 100644
+--- a/src/client/types.ts
++++ b/src/client/types.ts
+@@ -63,6 +63,7 @@ export const RestaurantSchema = z.object({
+   monthSales: z.string().optional(),
+   minOrderAmount: z.number().optional(),
+   deliveryFee: z.number().optional(),
++  promotionTags: z.array(z.string()).optional(),
+ });
+ export type Restaurant = z.infer<typeof RestaurantSchema>;
+ 
+diff --git a/src/commands/auth.ts b/src/commands/auth.ts
+index 6259685..ae6e139 100644
+--- a/src/commands/auth.ts
++++ b/src/commands/auth.ts
+@@ -18,18 +18,20 @@ export function buildAuthCommand(): Command {
+     .action(async (opts, cmd) => {
+       const globalOpts = cmd.optsWithGlobals() as GlobalOpts;
+       try {
+-        if (opts.token && opts.cookie) {
++        const delegatedCookie = process.env.MEITUAN_SAFE_COOKIE;
++        const cookie = opts.cookie ?? delegatedCookie;
++        if (opts.token && cookie) {
+           formatError('Cannot use both --token and --cookie. Choose one.', { json: globalOpts.json });
+           return;
+         }
+-        if (!opts.token && !opts.cookie) {
++        if (!opts.token && !cookie) {
+           formatError('Provide --token or --cookie. See: mt auth login --help', { json: globalOpts.json });
+           return;
+         }
+         // Ensure device identity exists before first auth
+         ensureDeviceIdentity();
+-        if (opts.cookie) {
+-          const result = loginWithCookie(opts.cookie);
++        if (cookie) {
++          const result = loginWithCookie(cookie);
+           format(result, { json: globalOpts.json });
+         } else {
+           const result = loginWithToken(opts.token as string);
+diff --git a/src/commands/waimai.test.ts b/src/commands/waimai.test.ts
+index b00af32..58ae004 100644
+--- a/src/commands/waimai.test.ts
++++ b/src/commands/waimai.test.ts
+@@ -861,6 +861,27 @@ describe('order commands', () => {
+     expect(parsed.ok).toBe(true);
+     expect(parsed.data.status).toBe('preparing');
+   });
++
++  it('order detail --json exposes the read-only history lookup', async () => {
++    const { requireAuth } = await import('../auth/session.js');
++    const { getOrderHistory } = await import('../services/order.js');
++    vi.mocked(requireAuth).mockResolvedValue({ token: 'tok', cookieString: 'token=tok', userAgent: 'ua' });
++    vi.mocked(getOrderHistory).mockResolvedValue({
++      orderId: 'ORD-001',
++      restaurantId: 'rest-123',
++      restaurantName: '测试餐厅',
++      items: [{ itemId: '1001', name: '羊肉串', qty: 2, unitPrice: 8 }],
++      total: 16,
++    });
++
++    const program = await buildProgram();
++    await program.parseAsync(['node', 'mt', '--json', 'waimai', 'order', 'detail', 'ORD-001']);
++
++    const parsed = JSON.parse(capturedStdout.trim());
++    expect(parsed.ok).toBe(true);
++    expect(parsed.data.items[0].name).toBe('羊肉串');
++    expect(getOrderHistory).toHaveBeenCalledWith(expect.anything(), 'ORD-001');
++  });
+ });
+ 
+ // ─── Reorder command tests ────────────────────────────────────────────────────
+diff --git a/src/commands/waimai.ts b/src/commands/waimai.ts
+index cc8cf4d..d15e359 100644
+--- a/src/commands/waimai.ts
++++ b/src/commands/waimai.ts
+@@ -6,7 +6,7 @@ import { searchRestaurants, getRestaurantDetail } from '../services/restaurant.j
+ import type { SearchParams, Restaurant } from '../services/restaurant.js';
+ import { getRestaurantMenu } from '../services/menu.js';
+ import { addToCart, getCart, removeFromCart, clearCart } from '../services/cart.js';
+-import { placeOrder, getOrderStatus, reorderFromHistory } from '../services/order.js';
++import { placeOrder, getOrderStatus, getOrderHistory, reorderFromHistory } from '../services/order.js';
+ import { applyCoupon } from '../services/coupon.js';
+ import { format, formatError } from '../output/formatter.js';
+ import { renderTable, renderKeyValue, renderMenu, renderCartSummary, renderOrderPreview } from '../output/table.js';
+@@ -19,9 +19,11 @@ export function buildWaimaiCommand(): Command {
+   const waimai = new Command('waimai').description('Food delivery commands');
+   waimai.addCommand(buildAddressCommand());
+   waimai.addCommand(buildSearchCommand());
++  waimai.addCommand(buildSearchAtCommand());
+   waimai.addCommand(buildDetailCommand());
+   waimai.addCommand(buildCompareCommand());
+   waimai.addCommand(buildMenuCommand());
++  waimai.addCommand(buildMenusCommand());
+   waimai.addCommand(buildCartCommand());
+   waimai.addCommand(buildOrderCommand());
+   waimai.addCommand(buildReorderCommand());
+@@ -29,6 +31,66 @@ export function buildWaimaiCommand(): Command {
+   return waimai;
+ }
+ 
++// Safe wrapper fast path: select temporary coordinates and fetch a bounded set
++// of pages while reusing one authenticated browser/signing context.
++// eslint-disable-next-line @typescript-eslint/no-explicit-any
++function buildSearchAtCommand(): Command<any, any, any> {
++  return new Command('search-at')
++    .argument('<keyword>', 'Search keyword')
++    .requiredOption('--label <label>', 'Human-readable location label')
++    .requiredOption('--lat <n>', 'GCJ-02 latitude', parseFloat)
++    .requiredOption('--lng <n>', 'GCJ-02 longitude', parseFloat)
++    .option('--city-id <n>', 'Meituan city ID (default: 0)', value => parseInt(value, 10))
++    .option('--page-start <n>', 'First page index (default: 0)', value => parseInt(value, 10), 0)
++    .option('--pages <n>', 'Number of pages, 1-10 (default: 1)', value => parseInt(value, 10), 1)
++    .option('--limit <n>', 'Results per page, 1-100 (default: 20)', value => parseInt(value, 10), 20)
++    .option('--sort <n>', 'Sort type (default: 0)', value => parseInt(value, 10), 0)
++    .description('Search at temporary coordinates with one reusable browser session')
++    .action(async (keyword, opts, cmd) => {
++      const globalOpts = cmd.optsWithGlobals() as GlobalOpts;
++      try {
++        if (!Number.isFinite(opts.lat) || opts.lat < -90 || opts.lat > 90 ||
++            !Number.isFinite(opts.lng) || opts.lng < -180 || opts.lng > 180) {
++          formatError('Invalid latitude or longitude.', { json: globalOpts.json });
++          return;
++        }
++        if (!Number.isInteger(opts.pageStart) || opts.pageStart < 0 ||
++            !Number.isInteger(opts.pages) || opts.pages < 1 || opts.pages > 10 ||
++            !Number.isInteger(opts.limit) || opts.limit < 1 || opts.limit > 100) {
++          formatError('Invalid page range.', { json: globalOpts.json });
++          return;
++        }
++
++        setActiveAddress({
++          id: `coordinate:${opts.lat},${opts.lng}`,
++          label: opts.label,
++          address: opts.label,
++          latitude: opts.lat,
++          longitude: opts.lng,
++          cityId: opts.cityId ?? 0,
++        });
++        const session = await requireAuth();
++        const client = createBrowserClient(session);
++        const allResults: Restaurant[] = [];
++        for (let offset = 0; offset < opts.pages; offset++) {
++          const results = await searchRestaurants(client, {
++            keyword,
++            lat: opts.lat,
++            lng: opts.lng,
++            page: opts.pageStart + offset,
++            limit: opts.limit,
++            sort: opts.sort,
++          });
++          allResults.push(...results);
++          if (results.length < opts.limit) break;
++        }
++        format(allResults, { json: globalOpts.json });
++      } catch (err) {
++        formatError(err instanceof Error ? err.message : String(err), { json: globalOpts.json });
++      }
++    });
++}
++
+ function buildAddressCommand(): Command {
+   const address = new Command('address').description('Manage delivery addresses');
+ 
+@@ -90,6 +152,38 @@ function buildAddressCommand(): Command {
+       }
+     });
+ 
++  address
++    .command('use-coordinates')
++    .requiredOption('--label <label>', 'Human-readable location label')
++    .requiredOption('--lat <n>', 'GCJ-02 latitude', parseFloat)
++    .requiredOption('--lng <n>', 'GCJ-02 longitude', parseFloat)
++    .option('--city-id <n>', 'Meituan city ID (default: 0)', parseInt)
++    .description('Use temporary coordinates for search without changing account addresses')
++    .action(async (opts, cmd) => {
++      const globalOpts = cmd.optsWithGlobals() as GlobalOpts;
++      try {
++        if (!Number.isFinite(opts.lat) || opts.lat < -90 || opts.lat > 90 ||
++            !Number.isFinite(opts.lng) || opts.lng < -180 || opts.lng > 180) {
++          formatError('Invalid latitude or longitude.', { json: globalOpts.json });
++          return;
++        }
++        setActiveAddress({
++          id: `coordinate:${opts.lat},${opts.lng}`,
++          label: opts.label,
++          address: opts.label,
++          latitude: opts.lat,
++          longitude: opts.lng,
++          cityId: opts.cityId ?? 0,
++        });
++        format(
++          { set: true, label: opts.label, lat: opts.lat, lng: opts.lng, cityId: opts.cityId ?? 0 },
++          { json: globalOpts.json }
++        );
++      } catch (err) {
++        formatError(err instanceof Error ? err.message : String(err), { json: globalOpts.json });
++      }
++    });
++
+   return address;
+ }
+ 
+@@ -288,6 +382,36 @@ function buildMenuCommand(): Command<any, any, any> {
+     });
+ }
+ 
++// eslint-disable-next-line @typescript-eslint/no-explicit-any
++function buildMenusCommand(): Command<any, any, any> {
++  return new Command('menus')
++    .argument('<restaurant-ids...>', 'Restaurant IDs to browse (1-10)')
++    .description('Browse multiple menus with one reusable browser session')
++    .action(async (restaurantIds: string[], _opts, cmd) => {
++      const globalOpts = cmd.optsWithGlobals() as GlobalOpts;
++      try {
++        if (restaurantIds.length < 1 || restaurantIds.length > 10) {
++          formatError('Menus requires 1-10 restaurant IDs.', { json: globalOpts.json });
++          return;
++        }
++        const session = await requireAuth();
++        const client = createBrowserClient(session);
++        const results = await Promise.allSettled(
++          restaurantIds.map(async restaurantId => {
++            const categories = await getRestaurantMenu(client, restaurantId);
++            return { restaurantId, items: categories.flatMap(category => category.items) };
++          })
++        );
++        const data = results.map((result, index) => result.status === 'fulfilled'
++          ? result.value
++          : { restaurantId: restaurantIds[index], items: [], error: String(result.reason) });
++        format(data, { json: globalOpts.json });
++      } catch (err) {
++        formatError(err instanceof Error ? err.message : String(err), { json: globalOpts.json });
++      }
++    });
++}
++
+ function buildCartCommand(): Command {
+   const cart = new Command('cart').description('Manage food delivery cart');
+   cart.addCommand(buildCartAddCommand());
+@@ -414,6 +538,7 @@ function buildOrderCommand(): Command {
+   const order = new Command('order').description('Place and track food delivery orders');
+   order.addCommand(buildOrderPlaceCommand());
+   order.addCommand(buildOrderStatusCommand());
++  order.addCommand(buildOrderDetailCommand());
+   return order;
+ }
+ 
+@@ -534,6 +659,24 @@ function buildOrderStatusCommand(): Command<any, any, any> {
+     });
+ }
+ 
++// eslint-disable-next-line @typescript-eslint/no-explicit-any
++function buildOrderDetailCommand(): Command<any, any, any> {
++  return new Command('detail')
++    .argument('<order-id>', 'Order ID to inspect')
++    .description('Read order details without changing the order')
++    .action(async (orderId, _opts, cmd) => {
++      const globalOpts = cmd.optsWithGlobals() as GlobalOpts;
++      try {
++        const session = await requireAuth();
++        const client = createBrowserClient(session);
++        const detail = await getOrderHistory(client, orderId);
++        format(detail, { json: globalOpts.json });
++      } catch (err) {
++        formatError(err instanceof Error ? err.message : String(err), { json: globalOpts.json });
++      }
++    });
++}
++
+ function buildCouponCommand(): Command {
+   const coupon = new Command('coupon').description('Manage coupons and promotions');
+   coupon.addCommand(buildCouponApplyCommand());
+diff --git a/src/index.ts b/src/index.ts
+index f73c579..288c580 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -2,6 +2,8 @@
+ import { Command } from '@commander-js/extra-typings';
+ import { buildAuthCommand } from './commands/auth.js';
+ import { buildWaimaiCommand } from './commands/waimai.js';
++import { buildDealCommand } from './commands/deal.js';
++import { closeBrowser } from './client/browser-http.js';
+ 
+ const program = new Command('mt')
+   .version('0.1.0')
+@@ -10,8 +12,14 @@ const program = new Command('mt')
+ 
+ program.addCommand(buildAuthCommand());
+ program.addCommand(buildWaimaiCommand());
++program.addCommand(buildDealCommand());
+ 
+-program.parseAsync().catch((err: unknown) => {
+-  process.stderr.write(`Fatal: ${err instanceof Error ? err.message : String(err)}\n`);
+-  process.exitCode = 1;
+-});
++program
++  .parseAsync()
++  .catch((err: unknown) => {
++    process.stderr.write(`Fatal: ${err instanceof Error ? err.message : String(err)}\n`);
++    process.exitCode = 1;
++  })
++  .finally(async () => {
++    await closeBrowser();
++  });
+diff --git a/src/services/restaurant.test.ts b/src/services/restaurant.test.ts
+index cb2938c..2974e0e 100644
+--- a/src/services/restaurant.test.ts
++++ b/src/services/restaurant.test.ts
+@@ -43,6 +43,8 @@ describe('searchRestaurants', () => {
+       delivery_time_tip: '38分钟',
+       shipping_fee_tip: '免配送费',
+       month_sales_tip: '月售200+',
++      min_price_tip: '20元起送',
++      activity_list: [{ text: '满30减5' }, { title: '新客立减' }],
+     };
+ 
+     nock(MEITUAN_BASE_URL)
+@@ -71,6 +73,8 @@ describe('searchRestaurants', () => {
+     expect(first?.deliveryTime).toBe('38分钟');
+     expect(first?.shippingFee).toBe('免配送费');
+     expect(first?.monthSales).toBe('月售200+');
++    expect(first?.minOrderAmount).toBe(20);
++    expect(first?.promotionTags).toEqual(['满30减5', '新客立减']);
+   });
+ 
+   it('sends POST with form-encoded body', async () => {
+diff --git a/src/services/restaurant.ts b/src/services/restaurant.ts
+index 78c5a48..ee20438 100644
+--- a/src/services/restaurant.ts
++++ b/src/services/restaurant.ts
+@@ -15,6 +15,37 @@ export interface SearchParams {
+   sort?: number;       // 0 = default
+ }
+ 
++function numericAmount(value: unknown): number | undefined {
++  if (typeof value === 'number' && Number.isFinite(value)) return value;
++  const match = String(value ?? '').match(/\d+(?:\.\d+)?/);
++  return match ? Number(match[0]) : undefined;
++}
++
++function promotionTags(shopData: Record<string, unknown>): string[] {
++  const tags = new Set<string>();
++  const visit = (value: unknown): void => {
++    if (typeof value === 'string') {
++      const text = value.trim();
++      if (text && text.length <= 80) tags.add(text);
++      return;
++    }
++    if (Array.isArray(value)) {
++      value.forEach(visit);
++      return;
++    }
++    if (value && typeof value === 'object') {
++      const record = value as Record<string, unknown>;
++      for (const key of ['text', 'content', 'label', 'title', 'description', 'activity_text', 'icon_text']) {
++        if (key in record) visit(record[key]);
++      }
++    }
++  };
++  for (const key of ['discounts2', 'discounts', 'activity_list', 'activity_info', 'promotion_info', 'poi_promotion_tags']) {
++    if (key in shopData) visit(shopData[key]);
++  }
++  return [...tags].slice(0, 20);
++}
++
+ /**
+  * Search restaurants via POST openh5/search/globalpage.
+  * Real API uses form-encoded POST body with wm_latitude/wm_longitude as integers (lat * 1e6).
+@@ -111,6 +142,9 @@ export async function searchRestaurants(
+         deliveryTime: shopData.delivery_time_tip ?? undefined,
+         shippingFee: shopData.shipping_fee_tip ?? undefined,
+         monthSales: shopData.month_sales_tip ?? undefined,
++        minOrderAmount: numericAmount(shopData.min_price ?? shopData.min_price_tip),
++        deliveryFee: numericAmount(shopData.shipping_fee ?? shopData.shipping_fee_tip),
++        promotionTags: promotionTags(shopData),
+       });
+     } catch {
+       // Skip modules with invalid string_data
+warning: in the working copy of 'src/commands/deal.ts', LF will be replaced by CRLF the next time Git touches it
+diff --git a/src/commands/deal.ts b/src/commands/deal.ts
+new file mode 100644
+index 0000000..2b37653
+--- /dev/null
++++ b/src/commands/deal.ts
+@@ -0,0 +1,74 @@
++import { Command } from '@commander-js/extra-typings';
++import { requireAuth } from '../auth/session.js';
++import { format, formatError } from '../output/formatter.js';
++import { resolveDealLocation, searchDeals } from '../services/deal.js';
++
++interface GlobalOpts {
++  json?: boolean;
++}
++
++export function buildDealCommand(): Command {
++  const deal = new Command('deal').description('Read-only Meituan in-store deal commands');
++
++  deal
++    .command('location')
++    .requiredOption('--address <address>', 'Named place or address')
++    .description('Resolve a Meituan city ID for in-store deals')
++    .action(async (opts, cmd) => {
++      const globalOpts = cmd.optsWithGlobals() as GlobalOpts;
++      try {
++        format(await resolveDealLocation(opts.address), { json: globalOpts.json });
++      } catch (err) {
++        formatError(err instanceof Error ? err.message : String(err), { json: globalOpts.json });
++      }
++    });
++
++  deal
++    .command('search')
++    .requiredOption('--keyword <keyword>', 'Deal or restaurant keyword')
++    .requiredOption('--lat <n>', 'GCJ-02 latitude', value => parseFloat(value))
++    .requiredOption('--lng <n>', 'GCJ-02 longitude', value => parseFloat(value))
++    .option('--address <address>', 'Named place used to resolve city ID')
++    .option('--city-id <id>', 'Meituan city ID')
++    .option('--page <n>', 'Page number (default: 1)', value => parseInt(value, 10), 1)
++    .option('--page-size <n>', 'Results per page, 1-20 (default: 10)', value => parseInt(value, 10), 10)
++    .option('--query-id <id>', 'Previous response query ID')
++    .option('--request-id <id>', 'Previous response request ID')
++    .description('Search nearby in-store group-buying deals')
++    .action(async (opts, cmd) => {
++      const globalOpts = cmd.optsWithGlobals() as GlobalOpts;
++      try {
++        if (!Number.isFinite(opts.lat) || opts.lat < -90 || opts.lat > 90 ||
++            !Number.isFinite(opts.lng) || opts.lng < -180 || opts.lng > 180) {
++          formatError('Invalid latitude or longitude.', { json: globalOpts.json });
++          return;
++        }
++        if (!Number.isInteger(opts.page) || opts.page < 1 ||
++            !Number.isInteger(opts.pageSize) || opts.pageSize < 1 || opts.pageSize > 20) {
++          formatError('Invalid deal page range.', { json: globalOpts.json });
++          return;
++        }
++        if (!opts.cityId && !opts.address) {
++          formatError('Provide --address or --city-id.', { json: globalOpts.json });
++          return;
++        }
++        const session = await requireAuth();
++        const result = await searchDeals(session, {
++          keyword: opts.keyword,
++          latitude: opts.lat,
++          longitude: opts.lng,
++          address: opts.address,
++          cityId: opts.cityId,
++          page: opts.page,
++          pageSize: opts.pageSize,
++          queryId: opts.queryId,
++          requestId: opts.requestId,
++        });
++        format(result, { json: globalOpts.json });
++      } catch (err) {
++        formatError(err instanceof Error ? err.message : String(err), { json: globalOpts.json });
++      }
++    });
++
++  return deal;
++}
+warning: in the working copy of 'src/services/deal.ts', LF will be replaced by CRLF the next time Git touches it
+diff --git a/src/services/deal.ts b/src/services/deal.ts
+new file mode 100644
+index 0000000..b4bc727
+--- /dev/null
++++ b/src/services/deal.ts
+@@ -0,0 +1,116 @@
++import type { Session } from '../types/index.js';
++
++const DEAL_SEARCH_URL = 'https://click.meituan.com/cps/ai/product/searchProductByAgent';
++const LOCATION_URL = 'https://click.meituan.com/cps/ai/product/getLocationByAddress';
++
++export interface DealSearchParams {
++  keyword: string;
++  latitude: number;
++  longitude: number;
++  address?: string;
++  cityId?: string;
++  page?: number;
++  pageSize?: number;
++  queryId?: string;
++  requestId?: string;
++}
++
++interface DealApiEnvelope {
++  code?: number;
++  success?: boolean;
++  message?: string;
++  data?: Record<string, unknown>;
++}
++
++async function postJson(
++  url: string,
++  body: Record<string, unknown>,
++  token?: string
++): Promise<DealApiEnvelope> {
++  const headers: Record<string, string> = {
++    'Content-Type': 'application/json',
++    'User-Agent': 'Mozilla/5.0',
++  };
++  if (token) headers.token = token;
++  const response = await fetch(url, {
++    method: 'POST',
++    headers,
++    body: JSON.stringify(body),
++    signal: AbortSignal.timeout(15000),
++  });
++  if (!response.ok) {
++    throw new Error(`Meituan deal API returned HTTP ${response.status}`);
++  }
++  const contentType = response.headers.get('content-type') || '';
++  if (!contentType.includes('json')) {
++    throw new Error(`Meituan deal API returned non-JSON response (${contentType || 'unknown'})`);
++  }
++  return await response.json() as DealApiEnvelope;
++}
++
++export async function resolveDealLocation(address: string): Promise<{
++  cityId: string;
++  cityName?: string;
++  latitude?: number;
++  longitude?: number;
++}> {
++  const result = await postJson(LOCATION_URL, { address });
++  if (result.code !== 200 || !result.success || !result.data) {
++    throw new Error(`Deal location failed: ${result.message || String(result.code)}`);
++  }
++  return {
++    cityId: String(result.data.cityId ?? ''),
++    cityName: typeof result.data.cityName === 'string' ? result.data.cityName : undefined,
++    latitude: typeof result.data.lat === 'number' ? result.data.lat : undefined,
++    longitude: typeof result.data.lng === 'number' ? result.data.lng : undefined,
++  };
++}
++
++export async function searchDeals(session: Session, params: DealSearchParams): Promise<{
++  products: Array<Record<string, unknown>>;
++  isLastPage: boolean;
++  queryId: string;
++  requestId: string;
++  cityId: string;
++}> {
++  let cityId = params.cityId;
++  if (!cityId) {
++    if (!params.address) throw new Error('Address or city ID is required for deal search');
++    cityId = (await resolveDealLocation(params.address)).cityId;
++  }
++  if (!cityId) throw new Error('Meituan did not resolve a city ID');
++
++  const body: Record<string, unknown> = {
++    keyword: params.keyword,
++    page: params.page ?? 1,
++    pageSize: String(params.pageSize ?? 10),
++    clientSource: 'coupon-fusion-workbuddy',
++    userParamDTO: {
++      lat: String(params.latitude),
++      lng: String(params.longitude),
++      token: session.token,
++      cityId,
++      app: 216,
++      platform: 1,
++      partner: 1018,
++    },
++  };
++  if (params.queryId) body.queryId = params.queryId;
++  if (params.requestId) body.requestId = params.requestId;
++
++  const result = await postJson(DEAL_SEARCH_URL, body, session.token);
++  if (result.code !== 200 || !result.success || !result.data) {
++    throw new Error(`Deal search failed: ${result.message || String(result.code)}`);
++  }
++  const rawProducts = result.data.productList;
++  const products = Array.isArray(rawProducts)
++    ? rawProducts.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object'))
++    : [];
++  return {
++    products,
++    isLastPage: Boolean(result.data.isLastPage),
++    queryId: String(result.data.queryId ?? ''),
++    requestId: String(result.data.requestId ?? ''),
++    cityId,
++  };
++}
+warning: in the working copy of 'src/services/deal.test.ts', LF will be replaced by CRLF the next time Git touches it
+diff --git a/src/services/deal.test.ts b/src/services/deal.test.ts
+new file mode 100644
+index 0000000..2fddb74
+--- /dev/null
++++ b/src/services/deal.test.ts
+@@ -0,0 +1,51 @@
++import { afterEach, describe, expect, it, vi } from 'vitest';
++import { resolveDealLocation, searchDeals } from './deal.js';
++
++const session = {
++  token: 'secret-token',
++  cookieString: 'token=secret-token',
++  userAgent: 'test-agent',
++};
++
++afterEach(() => {
++  vi.unstubAllGlobals();
++});
++
++describe('deal service', () => {
++  it('resolves a city ID without authentication', async () => {
++    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
++      code: 200,
++      success: true,
++      data: { cityId: 1, cityName: '北京', lat: 39.9, lng: 116.4 },
++    }), { status: 200, headers: { 'content-type': 'application/json' } }));
++    vi.stubGlobal('fetch', fetchMock);
++
++    const result = await resolveDealLocation('北京望京地铁站');
++    expect(result.cityId).toBe('1');
++    expect(fetchMock.mock.calls[0]![1]!.headers).not.toHaveProperty('token');
++  });
++
++  it('searches deals using the delegated token without returning it', async () => {
++    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
++      code: 200,
++      success: true,
++      data: {
++        productList: [{ productId: 1, poiName: '测试门店' }],
++        isLastPage: false,
++        queryId: 'query-1',
++        requestId: 'request-1',
++      },
++    }), { status: 200, headers: { 'content-type': 'application/json' } }));
++    vi.stubGlobal('fetch', fetchMock);
++
++    const result = await searchDeals(session, {
++      keyword: '烧烤',
++      latitude: 40,
++      longitude: 116.47,
++      cityId: '1',
++    });
++    expect(result.products).toHaveLength(1);
++    expect(result).not.toHaveProperty('token');
++    expect(fetchMock.mock.calls[0]![1]!.headers).toHaveProperty('token', 'secret-token');
++  });
++});
