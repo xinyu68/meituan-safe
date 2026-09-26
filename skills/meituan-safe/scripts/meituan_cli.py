@@ -5,20 +5,24 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import hashlib
 import json
 import math
 import os
 import re
+import secrets
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = "0.5.0"
+SCHEMA_VERSION = "0.7.1"
 SKILL_DIR = Path(__file__).resolve().parents[1]
 RUNTIME_DIR = SKILL_DIR / ".runtime"
 UPSTREAM_DIR = RUNTIME_DIR / "meituan-cli"
@@ -56,6 +60,27 @@ AUTH_COOKIE_NAMES = (
 )
 WINDOWS_CREDENTIAL_UTF16_LIMIT = 2400
 GEOCODE_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
+PASSPORT_BASE_URL = "https://passport.meituan.com"
+PASSPORT_CLIENT_ID = "c6f50b5a1e2f4e2bb00a3e2f58df3ced"
+PASSPORT_CSEC_PLATFORM = "7"
+PASSPORT_CSEC_VERSION = "1.4.2"
+PASSPORT_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60
+PASSPORT_ENTROPY = b"meituan-safe-passport-v1"
+DEAL_AUTH_ERROR_PATTERNS = (
+    "token校验异常",
+    "token 校验异常",
+    "token verification failed",
+)
+AUTH_ERROR_PATTERNS = (
+    "not logged in",
+    "session expired",
+    "authentication required",
+    "invalid cookie",
+    "missing cookie",
+    "登录已过期",
+    "登录失效",
+    "token已过期",
+)
 
 
 class MeituanError(RuntimeError):
@@ -231,6 +256,43 @@ def _require_runtime() -> None:
         )
 
 
+def _upstream_error(arguments: list[str], message: str) -> MeituanError:
+    lowered = message.lower()
+    is_deal_request = arguments[:2] == ["deal", "search"]
+    if any(value in lowered for value in ("http 403", "http 429", "captcha", "风控")):
+        return MeituanError(
+            "access_restricted",
+            "接口访问受限，不能据此判断登录过期或需要另一种授权",
+            details={"action": "investigate_access_or_request", "upstream_message": message[:500]},
+        )
+    if is_deal_request and any(pattern in lowered for pattern in DEAL_AUTH_ERROR_PATTERNS):
+        return MeituanError(
+            "deal_auth_rejected",
+            "团购接口未接受当前凭证；尚不能区分登录失效、授权范围或请求适配问题",
+            exit_code=2,
+            details={
+                "domain": "in_store_deals",
+                "action": "auth-check",
+                "login_refresh_recommended": False,
+                "upstream_message": message[:500],
+            },
+        )
+    auth_error = any(pattern in lowered for pattern in AUTH_ERROR_PATTERNS)
+    missing = any(value in lowered for value in ("not logged in", "missing cookie"))
+    if auth_error:
+        return MeituanError(
+            "not_logged_in" if missing else "auth_rejected",
+            "未找到登录凭证" if missing else "接口未接受当前登录凭证，不能仅凭此响应断定过期原因",
+            exit_code=2,
+            details={"action": "login" if missing else "auth-check", "upstream_message": message[:500]},
+        )
+    return MeituanError(
+        "upstream_error",
+        message,
+        retryable="non-json response" in lowered,
+    )
+
+
 def _run_mt(arguments: list[str], *, env: dict[str, str] | None = None) -> Any:
     _require_runtime()
     command = ["node", str(UPSTREAM_ENTRY), "--json", *arguments]
@@ -258,7 +320,7 @@ def _run_mt(arguments: list[str], *, env: dict[str, str] | None = None) -> Any:
             ) from exc
         if envelope.get("ok"):
             return envelope.get("data")
-        raise MeituanError("upstream_error", str(envelope.get("error") or "美团请求失败")) from exc
+        raise _upstream_error(arguments, str(envelope.get("error") or "美团请求失败")) from exc
     raw = completed.stdout.strip()
     try:
         envelope = json.loads(raw)
@@ -267,25 +329,7 @@ def _run_mt(arguments: list[str], *, env: dict[str, str] | None = None) -> Any:
         raise MeituanError("upstream_invalid_output", message[:1000]) from exc
     if not envelope.get("ok"):
         message = str(envelope.get("error") or completed.stderr or "美团请求失败")
-        lowered = message.lower()
-        auth_error = any(
-            value in lowered
-            for value in (
-                "not logged in",
-                "session expired",
-                "authentication required",
-                "invalid cookie",
-                "missing cookie",
-            )
-        )
-        raise MeituanError(
-            "not_logged_in" if auth_error else "upstream_error",
-            message,
-            retryable=not auth_error and any(
-                value in lowered for value in ("http 403", "http 429", "non-json response")
-            ),
-            exit_code=2 if auth_error else 1,
-        )
+        raise _upstream_error(arguments, message)
     return envelope.get("data")
 
 
@@ -308,6 +352,265 @@ def _cache_dir() -> Path:
     local = os.environ.get("LOCALAPPDATA")
     root = Path(local) if local else Path.home() / ".cache"
     return root / "meituan-safe" / "cache"
+
+
+def _passport_auth_path() -> Path:
+    suffix = ".bin" if os.name == "nt" else ".json"
+    return _cache_dir().parent / f"passport-auth{suffix}"
+
+
+def _passport_session_path() -> Path:
+    suffix = ".bin" if os.name == "nt" else ".json"
+    return _cache_dir().parent / f"passport-session{suffix}"
+
+
+def _dpapi_transform(data: bytes, *, protect: bool) -> bytes:
+    if os.name != "nt":
+        return data
+    import ctypes
+    from ctypes import wintypes
+
+    class DataBlob(ctypes.Structure):
+        _fields_ = [("size", wintypes.DWORD), ("data", ctypes.POINTER(ctypes.c_ubyte))]
+
+    def blob(value: bytes) -> tuple[DataBlob, Any]:
+        buffer = ctypes.create_string_buffer(value)
+        return DataBlob(len(value), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_ubyte))), buffer
+
+    input_blob, input_buffer = blob(data)
+    entropy_blob, entropy_buffer = blob(PASSPORT_ENTROPY)
+    output_blob = DataBlob()
+    crypt32 = ctypes.windll.crypt32
+    kernel32 = ctypes.windll.kernel32
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    if protect:
+        success = crypt32.CryptProtectData(
+            ctypes.byref(input_blob),
+            "meituan-safe Passport token",
+            ctypes.byref(entropy_blob),
+            None,
+            None,
+            0x1,
+            ctypes.byref(output_blob),
+        )
+    else:
+        success = crypt32.CryptUnprotectData(
+            ctypes.byref(input_blob),
+            None,
+            ctypes.byref(entropy_blob),
+            None,
+            None,
+            0x1,
+            ctypes.byref(output_blob),
+        )
+    del input_buffer, entropy_buffer
+    if not success:
+        raise ctypes.WinError()
+    try:
+        return ctypes.string_at(output_blob.data, output_blob.size)
+    finally:
+        kernel32.LocalFree(ctypes.cast(output_blob.data, ctypes.c_void_p))
+
+
+def _read_private_json(path: Path) -> dict[str, Any]:
+    try:
+        raw = path.read_bytes()
+        decoded = _dpapi_transform(raw, protect=False)
+        payload = json.loads(decoded.decode("utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return {}
+
+
+def _write_private_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    encoded = _dpapi_transform(raw, protect=True)
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_bytes(encoded)
+        if os.name != "nt":
+            temporary.chmod(0o600)
+        temporary.replace(path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _delete_private_file(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _passport_cached_token() -> str | None:
+    payload = _read_private_json(_passport_auth_path())
+    token = payload.get("token")
+    saved_at = payload.get("saved_at")
+    if not isinstance(token, str) or not token:
+        return None
+    try:
+        expired = time.time() - float(saved_at) >= PASSPORT_TOKEN_TTL_SECONDS
+    except (TypeError, ValueError):
+        expired = True
+    if expired:
+        _delete_private_file(_passport_auth_path())
+        return None
+    return token
+
+
+def _passport_request(pathname: str, params: dict[str, str]) -> dict[str, Any]:
+    query = urllib.parse.urlencode(params)
+    request = urllib.request.Request(
+        f"{PASSPORT_BASE_URL}{pathname}?{query}",
+        headers={
+            "Accept": "application/json, */*",
+            "Cache-Control": "no-cache",
+            "User-Agent": "Mozilla/5.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            payload = json.load(response)
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise MeituanError(
+            "passport_unavailable",
+            "美团 Passport 授权服务暂时不可用",
+            retryable=True,
+            exit_code=2,
+        ) from exc
+    if not isinstance(payload, dict) or payload.get("error"):
+        raise MeituanError("passport_failed", "美团 Passport 授权请求失败", exit_code=2)
+    code = payload.get("code")
+    if code is not None:
+        try:
+            success_code = int(code) in (0, 200)
+        except (TypeError, ValueError):
+            success_code = False
+        if not success_code:
+            raise MeituanError("passport_failed", "美团 Passport 授权请求失败", exit_code=2)
+    data = payload.get("data")
+    return data if isinstance(data, dict) else {}
+
+
+def _trusted_passport_link(value: str) -> bool:
+    parsed = urllib.parse.urlparse(value)
+    hostname = (parsed.hostname or "").lower()
+    return parsed.scheme == "https" and (
+        hostname == "dpurl.cn" or hostname == "meituan.com" or hostname.endswith(".meituan.com")
+    )
+
+
+def _write_passport_qr(auth_link: str) -> Path:
+    try:
+        import qrcode
+    except ImportError as exc:
+        raise MeituanError(
+            "dependency_missing",
+            "缺少二维码依赖，请重新运行 bootstrap.py",
+            exit_code=3,
+        ) from exc
+    output = _cache_dir().parent / "passport-auth-qr.png"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(f"{output.stem}.{os.getpid()}.tmp.png")
+    try:
+        image = qrcode.make(auth_link)
+        image.save(temporary)
+        temporary.replace(output)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    return output.resolve()
+
+
+def _run_deal_login(args: argparse.Namespace) -> dict[str, Any]:
+    cached = _passport_cached_token()
+    if cached and not args.force:
+        return {"authorized": True, "status": "cached", "token_exposed": False}
+    if args.force:
+        _delete_private_file(_passport_auth_path())
+    verifier = base64.urlsafe_b64encode(secrets.token_bytes(48)).rstrip(b"=").decode("ascii")
+    challenge = hashlib.sha256(verifier.encode("ascii")).hexdigest()
+    data = _passport_request(
+        "/api/account/userauth/code",
+        {
+            "client_id": PASSPORT_CLIENT_ID,
+            "code_challenge": challenge,
+            "csecplatform": PASSPORT_CSEC_PLATFORM,
+            "csecversion": PASSPORT_CSEC_VERSION,
+        },
+    )
+    auth_code = data.get("authCode") or data.get("auth_code")
+    auth_link = data.get("shortLink") or data.get("auth_link")
+    if not isinstance(auth_code, str) or not auth_code or not isinstance(auth_link, str):
+        raise MeituanError("passport_failed", "Passport 未返回有效授权链接", exit_code=2)
+    if not _trusted_passport_link(auth_link):
+        raise MeituanError("passport_failed", "Passport 返回了非美团 HTTPS 授权链接", exit_code=2)
+    _write_private_json(
+        _passport_session_path(),
+        {
+            "auth_code": auth_code,
+            "code_verifier": verifier,
+            "created_at": time.time(),
+        },
+    )
+    qr_image_path = _write_passport_qr(auth_link)
+    return {
+        "authorized": False,
+        "status": "authorization_required",
+        "auth_link": auth_link,
+        "qr_image_path": str(qr_image_path),
+        "token_exposed": False,
+    }
+
+
+def _run_deal_login_status() -> dict[str, Any]:
+    if _passport_cached_token():
+        return {"authorized": True, "status": "authorized", "token_exposed": False}
+    session = _read_private_json(_passport_session_path())
+    auth_code = session.get("auth_code")
+    verifier = session.get("code_verifier")
+    if not isinstance(auth_code, str) or not isinstance(verifier, str):
+        return {"authorized": False, "status": "not_started", "token_exposed": False}
+    data = _passport_request(
+        "/api/account/userauth/check",
+        {
+            "client_id": PASSPORT_CLIENT_ID,
+            "auth_code": auth_code,
+            "code_verifier": verifier,
+            "csecplatform": PASSPORT_CSEC_PLATFORM,
+            "csecversion": PASSPORT_CSEC_VERSION,
+        },
+    )
+    token = data.get("token") or data.get("accessToken")
+    if isinstance(token, str) and token:
+        _write_private_json(_passport_auth_path(), {"token": token, "saved_at": time.time()})
+        _delete_private_file(_passport_session_path())
+        return {"authorized": True, "status": "authorized", "token_exposed": False}
+    auth_status = int(data.get("authStatus") or 0)
+    if auth_status == 2:
+        _delete_private_file(_passport_session_path())
+        return {"authorized": False, "status": "cancelled", "token_exposed": False}
+    if auth_status == 3:
+        _delete_private_file(_passport_session_path())
+        return {"authorized": False, "status": "risk_denied", "token_exposed": False}
+    if auth_status == 5:
+        _delete_private_file(_passport_session_path())
+        return {"authorized": False, "status": "expired", "token_exposed": False}
+    return {"authorized": False, "status": "pending", "token_exposed": False}
+
+
+def _run_deal_logout() -> dict[str, Any]:
+    _delete_private_file(_passport_auth_path())
+    _delete_private_file(_passport_session_path())
+    _delete_private_file(_cache_dir().parent / "passport-auth-qr.png")
+    return {"authorized": False, "status": "logged_out"}
 
 
 def _geocode_cache_path() -> Path:
@@ -639,7 +942,20 @@ def _run_deals_search(args: argparse.Namespace) -> dict[str, Any]:
         command.extend(["--query-id", args.query_id])
     if args.request_id:
         command.extend(["--request-id", args.request_id])
-    raw = _run_mt(command)
+    auth_source, delegated = _deal_auth_environment(args.auth_source)
+    try:
+        raw = _run_mt(command, env=delegated)
+    except MeituanError as exc:
+        exc.details["auth_source"] = auth_source
+        if exc.code in ("deal_auth_rejected", "auth_rejected"):
+            if auth_source == "passport_pkce":
+                _delete_private_file(_passport_auth_path())
+                exc.details["action"] = "deal-login"
+            else:
+                exc.details["action"] = "auth-check"
+        raise
+    if not isinstance(raw, dict) or not isinstance(raw.get("products"), list):
+        raise MeituanError("upstream_invalid_output", "团购接口结果缺少有效商品列表")
     products = raw.get("products", []) if isinstance(raw, dict) else []
     normalized = [_normalize_deal(dict(item)) for item in products if isinstance(item, dict)]
     matched: list[dict[str, Any]] = []
@@ -695,6 +1011,7 @@ def _run_deals_search(args: argparse.Namespace) -> dict[str, Any]:
         "query_id": str(raw.get("queryId") or "") if isinstance(raw, dict) else "",
         "request_id": str(raw.get("requestId") or "") if isinstance(raw, dict) else "",
         "coverage": "meituan_ranked_deal_results_not_exhaustive",
+        "authentication": {"source": auth_source, "api_verified": True, "scope": "deal_search_request"},
     }
 
 
@@ -782,6 +1099,7 @@ def _food_projection_from_deals(
         "deal_estimates_excluded_from_store_average": True,
         "data_origin": "restaurant_fields_projected_from_meituan_deal_catalog",
         "coverage": "meituan_ranked_restaurants_with_deals_not_exhaustive",
+        "authentication": deal_result.get("authentication"),
     }
 
 
@@ -910,7 +1228,7 @@ def _validate_coordinates(latitude: float, longitude: float) -> None:
 async def _run_login(args: argparse.Namespace) -> dict[str, Any]:
     _require_runtime()
     try:
-        from playwright.async_api import async_playwright
+        from playwright.async_api import Error as PlaywrightError, async_playwright
     except ImportError as exc:
         raise MeituanError("dependency_missing", "缺少 Playwright，请先运行 bootstrap.py", exit_code=3) from exc
 
@@ -919,6 +1237,7 @@ async def _run_login(args: argparse.Namespace) -> dict[str, Any]:
     previous_windows, previous_foreground = _windows_snapshot()
     async with async_playwright() as playwright:
         launch_options: dict[str, Any] = {
+            **_login_mobile_options(playwright),
             "user_data_dir": str(profile_dir),
             "headless": False,
             "locale": "zh-CN",
@@ -928,6 +1247,8 @@ async def _run_login(args: argparse.Namespace) -> dict[str, Any]:
             launch_options["channel"] = args.channel
         context = await playwright.chromium.launch_persistent_context(**launch_options)
         try:
+            if args.force:
+                await context.clear_cookies()
             page = context.pages[-1] if context.pages else await context.new_page()
             await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=45_000)
             await page.wait_for_timeout(2_000)
@@ -974,22 +1295,44 @@ async def _run_login(args: argparse.Namespace) -> dict[str, Any]:
             return {
                 "logged_in": bool(status.get("loggedIn")),
                 "auth_mode": status.get("authMode"),
+                "browser_mode": "mobile",
                 "browser_focus_mode": "visible_no_activate" if os.name == "nt" else "visible",
                 "browser_windows_adjusted": demoted_windows,
                 "delegated_cookie_count": len(delegated_cookie_names),
+                "forced": bool(args.force),
+                "verification_scope": "stored_credentials_only",
+                "api_verified": False,
             }
         finally:
-            await context.close()
+            try:
+                await context.close()
+            except PlaywrightError as exc:
+                # Closing an already-closed browser must not replace the login result.
+                if "Target page, context or browser has been closed" not in str(exc):
+                    raise
 
 
 def _run_status() -> dict[str, Any]:
+    deal_authorized = _passport_cached_token() is not None
+    deal_status = {
+        "verification_scope": "stored_credentials_only",
+        "in_store_deal_auth": "stored_unverified" if deal_authorized else "not_stored",
+        "in_store_deal_auth_mode": "passport_pkce",
+        "api_verified": False,
+        "note": "状态仅表示本地凭证存在；无 Passport 时可尝试共享登录，使用 auth-check 对照验证",
+    }
     try:
         status = _run_mt(["auth", "whoami"])
     except MeituanError as exc:
         if exc.code == "not_logged_in":
-            return {"logged_in": False, "auth_mode": None}
+            return {"logged_in": False, "auth_mode": None, "shared_auth_state": "not_stored", **deal_status}
         raise
-    return {"logged_in": bool(status.get("loggedIn")), "auth_mode": status.get("authMode")}
+    return {
+        "logged_in": bool(status.get("loggedIn")),
+        "auth_mode": status.get("authMode"),
+        "shared_auth_state": "stored_unverified" if status.get("loggedIn") else "not_stored",
+        **deal_status,
+    }
 
 
 def _run_nearby_search(args: argparse.Namespace) -> dict[str, Any]:
@@ -1181,6 +1524,7 @@ def _capabilities() -> dict[str, Any]:
     return {
         "read": [
             "status",
+            "auth-check",
             "geocode",
             "addresses",
             "nearby-search",
@@ -1194,7 +1538,7 @@ def _capabilities() -> dict[str, Any]:
             "order-status",
             "order-detail",
         ],
-        "interactive": ["login"],
+        "interactive": ["login", "deal-login", "deal-login-status"],
         "unsupported": ["coupon_claiming", "cart_mutation", "order_submission", "payment", "captcha_bypass"],
         "location": {"geocoder": "OpenStreetMap Nominatim", "meituan_coordinates": "GCJ-02"},
         "notes": {
@@ -1202,6 +1546,7 @@ def _capabilities() -> dict[str, Any]:
             "deals": "read_only_ranked_results_not_exhaustive",
             "food_search": "restaurant_view_distinct_from_deals;official_store_average_only",
             "deal_average_price": "official_or_conservative_package_size_estimate;filter_fails_closed_when_missing",
+            "deal_auth": "auto:cached_passport_else_shared;explicit_shared_comparison_supported;token_never_printed",
             "orders": "read_only_and_requires_exact_order_id",
             "recommendation_score": "local_heuristic_not_meituan_ranking",
         },
@@ -1210,6 +1555,14 @@ def _capabilities() -> dict[str, Any]:
 
 def _schemas() -> dict[str, Any]:
     return {
+        "auth-check": {
+            "since": "0.7.0",
+            "params": {
+                "location": {"type": "string", "required": True},
+                "keyword": {"type": "string", "default": "美食"},
+            },
+            "semantics": "read-only;one search per endpoint using shared credentials;no Passport fallback or login",
+        },
         "nearby-search": {
             "since": "0.1.0",
             "params": {
@@ -1237,6 +1590,7 @@ def _schemas() -> dict[str, Any]:
         "deals-search": {
             "since": "0.4.0",
             "params": {
+                "auth_source": {"type": "string", "default": "auto", "enum": ["auto", "shared", "passport"], "since": "0.7.0"},
                 "keyword": {"type": "string", "required": True},
                 "location": {"type": "string", "required_unless": "lat,lng,city_id"},
                 "radius": {"type": "integer", "default": 1000, "min": 100, "max": 20000},
@@ -1255,6 +1609,7 @@ def _schemas() -> dict[str, Any]:
         "food-search": {
             "since": "0.5.0",
             "params": {
+                "auth_source": {"type": "string", "default": "auto", "enum": ["auto", "shared", "passport"], "since": "0.7.0"},
                 "keyword": {"type": "string", "required": True},
                 "location": {"type": "string", "required_unless": "lat,lng,city_id"},
                 "radius": {"type": "integer", "default": 1000, "min": 100, "max": 20000},
@@ -1297,11 +1652,19 @@ def _parser() -> argparse.ArgumentParser:
     schema.add_argument(
         "--method",
         dest="schema_method",
-        choices=("nearby-search", "food-search", "deals-search", "menu-search", "order-status", "order-detail"),
+        choices=("auth-check", "nearby-search", "food-search", "deals-search", "menu-search", "order-status", "order-detail"),
     )
     login = commands.add_parser("login", help="显示浏览器并等待用户登录")
     login.add_argument("--timeout", type=int, default=600)
+    login.add_argument("--force", action="store_true", help="清除专用浏览器 Profile 中的旧 Cookie 后重新登录")
+    deal_login = commands.add_parser("deal-login", help="发起到店团购 Passport 授权")
+    deal_login.add_argument("--force", action="store_true", help="忽略仍在有效期内的团购授权并重新授权")
+    commands.add_parser("deal-login-status", help="单次查询到店团购授权结果")
+    commands.add_parser("deal-logout", help="清除本机保存的到店团购授权")
     commands.add_parser("status", help="检查委托登录状态")
+    auth_check = commands.add_parser("auth-check", help="用同一份共享登录凭证对照验证外卖与团购，不重新授权")
+    auth_check.add_argument("--location", required=True)
+    auth_check.add_argument("--keyword", default="美食")
     geocode = commands.add_parser("geocode", help="解析地点候选")
     geocode.add_argument("--location", required=True)
     geocode.add_argument("--limit", type=int, default=5, choices=range(1, 11), metavar="1-10")
@@ -1330,6 +1693,7 @@ def _parser() -> argparse.ArgumentParser:
     nearby.add_argument("--min-monthly-sales", type=float)
     nearby.add_argument("--require-promotion", action="store_true")
     deals = commands.add_parser("deals-search", help="按地点搜索到店团购套餐")
+    deals.add_argument("--auth-source", choices=("auto", "shared", "passport"), default="auto")
     deals.add_argument("--location")
     deals.add_argument("--location-index", type=int, default=1)
     deals.add_argument("--lat", type=float)
@@ -1348,6 +1712,7 @@ def _parser() -> argparse.ArgumentParser:
     deals.add_argument("--request-id", default="")
     deals.add_argument("--limit", type=int, default=20, choices=range(1, 101), metavar="1-100")
     food = commands.add_parser("food-search", help="按地点搜索到店美食门店（与团购套餐分开）")
+    food.add_argument("--auth-source", choices=("auto", "shared", "passport"), default="auto")
     food.add_argument("--location")
     food.add_argument("--location-index", type=int, default=1)
     food.add_argument("--lat", type=float)
@@ -1395,8 +1760,16 @@ def _dispatch(args: argparse.Namespace) -> tuple[Any, list[str] | None]:
         return schemas.get(args.schema_method) if args.schema_method else schemas, None
     if args.command == "login":
         return asyncio.run(_run_login(args)), ["meituan_cli.py status"]
+    if args.command == "deal-login":
+        return _run_deal_login(args), ["展示 qr_image_path，让用户用美团 App 扫码授权，然后运行 deal-login-status"]
+    if args.command == "deal-login-status":
+        return _run_deal_login_status(), None
+    if args.command == "deal-logout":
+        return _run_deal_logout(), None
     if args.command == "status":
         return _run_status(), None
+    if args.command == "auth-check":
+        return _run_auth_check(args), None
     if args.command == "geocode":
         return {"query": args.location, "candidates": _geocode(args.location, args.limit)}, None
     if args.command == "addresses":
@@ -1426,6 +1799,95 @@ def _dispatch(args: argparse.Namespace) -> tuple[Any, list[str] | None]:
     if args.command == "order-detail":
         return _run_mt(["waimai", "order", "detail", args.order_id]), None
     raise MeituanError("unknown_command", f"未知命令：{args.command}", exit_code=3)
+
+
+def _shared_auth_environment() -> dict[str, str]:
+    delegated = os.environ.copy()
+    delegated.pop("MEITUAN_SAFE_DEAL_TOKEN", None)
+    return delegated
+
+
+def _deal_auth_environment(source: str) -> tuple[str, dict[str, str]]:
+    delegated = _shared_auth_environment()
+    if source not in ("auto", "shared", "passport"):
+        raise MeituanError("invalid_auth_source", "未知认证来源", exit_code=3)
+    token = _passport_cached_token() if source != "shared" else None
+    if token:
+        delegated["MEITUAN_SAFE_DEAL_TOKEN"] = token
+        return "passport_pkce", delegated
+    if source == "passport":
+        raise MeituanError(
+            "deal_login_required", "指定的 Passport 授权未保存，请执行 deal-login 或改用 shared",
+            exit_code=2, details={"action": "deal-login", "auth_source": "passport_pkce"},
+        )
+    return "shared", delegated
+
+
+def _auth_check_failure(error: MeituanError) -> dict[str, Any]:
+    state = {
+        "not_logged_in": "missing_credentials",
+        "auth_rejected": "credential_rejected",
+        "deal_auth_rejected": "credential_rejected",
+        "access_restricted": "access_restricted",
+    }.get(error.code, "unavailable")
+    # Do not include raw auth responses or credential previews in diagnostics.
+    return {"state": state, "api_verified": False, "error_code": error.code}
+
+
+def _run_auth_check(args: argparse.Namespace) -> dict[str, Any]:
+    delegated = _shared_auth_environment()
+    stored = _run_mt(["auth", "whoami"], env=delegated)
+    checks: dict[str, Any] = {}
+    if not isinstance(stored, dict) or not isinstance(stored.get("loggedIn"), bool):
+        raise MeituanError("upstream_invalid_output", "无法识别本地凭证状态")
+    if not stored["loggedIn"]:
+        checks = {name: {"state": "missing_credentials", "api_verified": False} for name in ("waimai", "deals")}
+    else:
+        candidates = _geocode(args.location)
+        if not candidates:
+            raise MeituanError("location_not_found", f"没有解析到地点：{args.location}", exit_code=3)
+        selected = candidates[0]
+        lat, lng = _wgs84_to_gcj02(selected["latitude_wgs84"], selected["longitude_wgs84"])
+        commands = {
+            "waimai": ["waimai", "search-at", args.keyword, "--label", args.location,
+                       "--lat", str(lat), "--lng", str(lng), "--pages", "1", "--limit", "1"],
+            "deals": ["deal", "search", "--keyword", args.keyword, "--address", args.location,
+                      "--lat", str(lat), "--lng", str(lng), "--page", "1", "--page-size", "1"],
+        }
+        for name, command in commands.items():
+            try:
+                raw = _run_mt(command, env=delegated)
+                items = raw if name == "waimai" else (raw.get("products") if isinstance(raw, dict) else None)
+                if not isinstance(items, list):
+                    raise MeituanError("upstream_invalid_output", "无法识别查询结果")
+                checks[name] = {"state": "verified", "api_verified": True, "returned_count": len(items)}
+            except MeituanError as exc:
+                checks[name] = _auth_check_failure(exc)
+    states = {name: check["state"] for name, check in checks.items()}
+    verified = all(check["api_verified"] for check in checks.values())
+    if verified:
+        action = "none"
+    elif any(state in ("access_restricted", "unavailable") for state in states.values()):
+        action = "investigate_access_or_request"
+    elif states["waimai"] in ("missing_credentials", "credential_rejected"):
+        action = "login_then_recheck"
+    else:
+        action = "offer_passport_authorization"
+    return {
+        "auth_source": "shared", "verification_scope": "live_read_only_searches",
+        "shared_login_verified": verified, "checks": checks, "next_action": action,
+        "separate_login_required": None,
+        "note": "诊断完成不等于登录验证通过；凭证被拒绝不证明过期或必须分别登录；不自动重试或重新授权",
+    }
+
+
+def _login_mobile_options(playwright: Any) -> dict[str, Any]:
+    # Render the official H5 login as a mobile page without requiring DevTools.
+    device = playwright.devices["Pixel 7"]
+    return {
+        key: device[key]
+        for key in ("user_agent", "viewport", "device_scale_factor", "is_mobile", "has_touch")
+    }
 
 
 def main() -> None:

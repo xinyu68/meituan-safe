@@ -48,8 +48,27 @@ the Meituan agent product search endpoint documented by the referenced
 reimplemented. Its bundled passport package, obfuscated CLIGuard, updater,
 coupon-claiming, ordering, and payment-related code are not included.
 
-The existing delegated Meituan cookie token is sent only to the Meituan-owned
-deal endpoint. Results are normalized to product ID, POI ID, restaurant, package
+Version 0.6 added an optional Passport authorization using standard HTTPS and PKCE
+after a shared-credential rejection. That observation did not establish that
+the endpoint always requires a dedicated token. The authorization uses:
+`/api/account/userauth/code` creates a user authorization link and
+`/api/account/userauth/check` performs a single status check. The wrapper does
+not bundle the reference project's private tarball, obfuscated CLIGuard,
+updater, coupon, ordering, or payment code. The user must explicitly confirm the
+authorization in the Meituan app. `deal-login` writes a local PNG QR code for
+the returned HTTPS link and returns its absolute `qr_image_path`; desktop agents
+must render that image instead of treating the link as a browser login page.
+
+Passport tokens never appear in CLI arguments or JSON output. On Windows the
+token and pending PKCE session are encrypted for the current OS user with DPAPI;
+on other platforms the local files use mode `0600`. The token is delegated to
+the pinned Node runtime only through `MEITUAN_SAFE_DEAL_TOKEN`. A rejected token
+is removed and reported as `deal_auth_rejected`, after which callers use
+`deal-login --force` once instead of repeating the H5 login.
+The deal command uses this delegated Passport token directly, so a separate
+H5/waimai login is not required for in-store search.
+
+Successful results are normalized to product ID, POI ID, restaurant, package
 title, returned prices, rating, distance, image, sales label, and URL when those
 fields are present. Official average spend takes precedence. When it is absent,
 the wrapper recognizes explicit package sizes such as 单人餐, 双人餐, 2人餐, or
@@ -96,6 +115,63 @@ The browser may hold more cookie data than Windows Credential Manager accepts as
 a UTF-16 password. Login delegates only an allowlisted authentication subset,
 requires `token` and `userId`, and keeps the serialized UTF-16 payload below a
 conservative 2400-byte limit. Cookie values are never logged.
+
+`status` reports local H5 and Passport credential presence separately, not
+end-to-end validation of every Meituan business API. `login --force` clears H5
+cookies only. `deal-login --force` starts a fresh Passport PKCE authorization;
+`deal-login-status` performs one non-blocking status check, and `deal-logout`
+removes the local Passport token and pending session.
+
+Version 0.7 removes the wrapper's mandatory Passport gate. `auto` uses a cached
+Passport token when present and otherwise lets the upstream `requireAuth()`
+reuse the shared login, as it did before version 0.6. Explicit `shared` clears
+the delegated Passport environment variable and does not read or delete the
+Passport cache; explicit `passport` still requires that authorization. Search
+results identify the credential source and the endpoint actually verified.
+
+`auth-check --location ...` compares the two businesses using the same shared
+credential source. It first checks local presence without exposing credential
+previews, then performs one waimai search and one deal search, without credential
+writes, retries, or Passport fallback. A valid empty result still verifies API
+acceptance; malformed output, timeouts, and HTTP failures do not. Diagnostic
+envelope success only means the comparison completed; callers must inspect
+`shared_login_verified` and each `checks` entry. A valid H5 login followed by a
+deal rejection makes Passport an option, not proof that all users need two logins.
+
+HTTP 403/429 and explicit risk/captcha failures are `access_restricted`, not
+automatic re-login triggers. Upstream `Session expired`/401 errors are reported
+as `auth_rejected`; they establish rejection but do not independently prove its
+cause. A rejected Passport is invalidated only when Passport was the selected
+source. A shared rejection does not remove Passport or force its authorization.
+
+The upstream patch also keeps the shared credential internally consistent:
+when a full cookie contains a token, that same sanitized token is used in the
+deal request instead of a leftover standalone token. A successful cookie import
+removes the old standalone credential, and a successful standalone-token import
+removes the old cookie. This does not touch the optional Passport cache. It fixes
+a possible mixed-credential failure; it does not establish the cause of any
+particular live 401 or 403 response.
+
+Desktop Passport QR experiments are not part of the supported H5 login. They
+confirmed website authorization but did not pass waimai search verification;
+mapping web cookie names or retaining cookies is not itself an end-to-end test.
+No such experimental conversion is shipped. `login` and `status` explicitly
+report stored-only verification, and existing `logged_in` means local credential
+presence, not successful authentication against both services.
+
+A live shared-source check after official H5 re-login returned both waimai and
+deal results without Passport fallback. This verifies that one shared login can
+work for both tested endpoints; it is not a guarantee for every account or future
+request. Login cleanup ignores only Playwright's already-closed-target error so
+it cannot turn a saved login into failure or mask an earlier import failure.
+
+Version 0.7.1 launches the interactive H5 login with Playwright's Pixel 7 mobile
+viewport, user agent, device scale factor, and touch emulation. These context
+options are applied before the first navigation, so a desktop user does not
+need to open DevTools and switch to mobile mode. Only the dedicated login
+context changes; the normal browser, stored credentials, and headless business
+query runtime are untouched. This is page-rendering configuration, not a way to
+bypass verification or risk controls.
 
 ## Orders
 

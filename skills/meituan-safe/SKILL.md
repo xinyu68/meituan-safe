@@ -28,11 +28,16 @@ Use the Python path printed by bootstrap. On Windows it is normally
 <runtime-python> <SKILL_DIR>/scripts/meituan_cli.py capabilities
 <runtime-python> <SKILL_DIR>/scripts/meituan_cli.py schema
 <runtime-python> <SKILL_DIR>/scripts/meituan_cli.py login
+<runtime-python> <SKILL_DIR>/scripts/meituan_cli.py deal-login
+<runtime-python> <SKILL_DIR>/scripts/meituan_cli.py deal-login-status
+<runtime-python> <SKILL_DIR>/scripts/meituan_cli.py deal-logout
 <runtime-python> <SKILL_DIR>/scripts/meituan_cli.py status
+<runtime-python> <SKILL_DIR>/scripts/meituan_cli.py auth-check --location "北京望京地铁站" --keyword "汉堡"
 <runtime-python> <SKILL_DIR>/scripts/meituan_cli.py geocode --location "北京望京地铁站"
 <runtime-python> <SKILL_DIR>/scripts/meituan_cli.py food-search --location "北京望京地铁站" --keyword "烧烤" --radius 1000 --min-rating 4.0 --limit 20
 <runtime-python> <SKILL_DIR>/scripts/meituan_cli.py nearby-search --location "北京望京地铁站" --keyword "烧烤" --radius 1000 --limit 20
 <runtime-python> <SKILL_DIR>/scripts/meituan_cli.py deals-search --location "北京望京地铁站" --keyword "烧烤" --radius 1000 --min-rating 4.0 --limit 20
+<runtime-python> <SKILL_DIR>/scripts/meituan_cli.py deals-search --location "北京望京地铁站" --keyword "烧烤" --auth-source shared
 <runtime-python> <SKILL_DIR>/scripts/meituan_cli.py nearby-search --location "北京望京地铁站" --keyword "烧烤" --radius 1000 --pages 3 --min-rating 4.6 --max-delivery-fee 5 --sort-by recommended
 <runtime-python> <SKILL_DIR>/scripts/meituan_cli.py addresses
 <runtime-python> <SKILL_DIR>/scripts/meituan_cli.py restaurant --id <restaurant-id>
@@ -46,18 +51,57 @@ Use the Python path printed by bootstrap. On Windows it is normally
 
 ## Workflow
 
-- Run `login` only when authentication is missing or expired. The visible Chrome
+- Run `login` when authentication is missing or a rejected session needs refreshing. Use `login --force`
+  only when an H5/外卖 API rejects a stored session and the user agrees to log in
+  again. The visible Chrome
   window belongs to the user; wait for them to complete login or verification.
   It opens the official forced-login route directly so the phone/SMS and any
   official third-party login controls are visible instead of relying on a home-
   page login link.
+  The dedicated login browser uses a mobile viewport, user agent, and touch
+  emulation so the H5 page renders without a manual F12/device-mode switch.
+  This affects only the skill's login window, not the user's default browser.
   On Windows it opens visible without activation and is explicitly marked
   non-topmost, so the user can select it from the taskbar without losing focus
   repeatedly. The CLI delegates the resulting session internally and never
   prints cookies.
+- `food-search` and `deals-search` default to `--auth-source auto`: reuse an
+  existing Passport authorization when present, otherwise try the shared login
+  credentials from `login`. Passport is optional, not a mandatory second login.
+  `--auth-source shared` explicitly tests the common credential without using
+  or removing Passport; `--auth-source passport` explicitly selects Passport.
+- When diagnosing whether one login works for both businesses, run `auth-check`
+  with the user's named place. It makes at most one search per business with
+  the shared credential source, never falls back to Passport, refreshes login,
+  or changes saved credentials. Read `checks` and `shared_login_verified`:
+  top-level `ok` only means the diagnostic ran, not that login works. Rejection
+  of an old credential cannot establish that separate logins are required.
+- A shared-credential rejection routes to `auth-check`. If the shared login is
+  rejected by waimai too, obtain consent to refresh it and compare again before
+  concluding that another authorization is needed. If waimai verifies while
+  deals reject the shared credential, offer Passport authorization; describe it
+  as an available alternative, not proof of a platform-wide two-login rule.
+  `access_restricted` (including HTTP 403/429) and request failures do not imply
+  expired credentials. Stop automatic retries and inspect the reported failure;
+  do not switch identities or ask for repeated scans to evade access controls.
+- When the user chooses Passport, run `deal-login`, show its HTTPS `auth_link`
+  and render `qr_image_path` inline for Meituan App scanning. Wait for the user
+  to confirm, then run `deal-login-status` once and resume only on
+  `authorized: true`. A rejection whose `auth_source` is `passport_pkce` may be
+  recovered with one `deal-login --force`; it says nothing about shared login.
+  Do not print, request, or accept tokens. Public merchant-page fallback requires
+  the user's choice and must not be reported as successful authenticated search.
+- `status` and `login` describe stored credentials only (`api_verified: false`).
+  Passport authorization completion is not business-API verification either.
+  A successful search verifies only its selected source and endpoint at that
+  time. The current H5 login remains the official phone/SMS page; a desktop
+  website QR confirmation or differently named cookies are not proof of usable
+  H5 credentials. Do not advertise an unverified QR-to-waimai conversion.
 - For named-place searches, run `geocode` when ambiguity matters. If the first
   candidate is wrong, rerun `nearby-search` with `--location-index` from the
   returned candidate list, or pass trusted GCJ-02 `--lat` and `--lng` values.
+  Skip a separate `geocode` call when the named place is already unambiguous;
+  the search command resolves it internally.
 - Route 到店美食、门店、餐厅评分 and 门店官方人均 to `food-search`.
   Route 团购、套餐、代金券 and 套餐折算人均 to `deals-search`. Route 外卖、
   配送、起送价 and 菜品 delivery discovery to `nearby-search`. When the user
@@ -88,13 +132,13 @@ Use the Python path printed by bootstrap. On Windows it is normally
 - Nearby search batches coordinate selection and all requested pages into one
   headless browser session. Use `menus` instead of separate `menu` calls when
   reading more than one restaurant so the signing browser is reused.
-- Login and human verification are the only visible-browser flows. All other
-  commands keep their signing browser headless. Do not bypass captchas, risk
-  controls, or device confirmation.
+- H5 login and Passport authorization are the only user-interactive flows. All
+  other commands keep their signing browser headless. Do not bypass captchas,
+  risk controls, or device confirmation.
 
 ## Boundary
 
-This version supports login delegation, login status, saved-address lookup,
+This version supports separate H5 and Passport login delegation, login status, saved-address lookup,
 named-place geocoding, separate read-only in-store restaurant and deal views, paginated and filtered
 food-delivery restaurant search, restaurant comparison, menu and dish search,
 promotion-label display, and exact-ID order status/detail reads. It does not

@@ -18,10 +18,11 @@ python "$env:USERPROFILE\.codex\skills\.system\skill-installer\scripts\install-s
 
 ## 支持的功能
 
-- 打开美团官方登录页，由用户完成手机号、验证码或页面提供的登录方式
-- 检查登录状态和读取当前账号保存的地址
+- 以手机模式打开美团官方登录页，无需手动 F12 切换，由用户完成手机号、验证码或页面提供的登录方式
+- 检查本地凭证状态、对照验证共享登录能否访问外卖与团购，以及读取当前账号保存的地址
 - 解析中文地点，并在同名地点之间选择正确候选
-- 按地点、关键词、半径、评分和价格搜索到店餐厅或团购
+- 通过美团 Passport 的标准 PKCE 授权获取独立团购令牌，并在电脑端生成二维码供美团 App 扫码确认
+- 按地点、关键词、半径、评分和价格搜索到店餐厅或团购；支持共享登录或可选 Passport 授权，不强制两次登录
 - 单独查询到店美食门店，返回门店官方人均、评分和距离
 - 单独查询团购套餐，返回套餐价格、适用人数、评分、距离和套餐折算人均
 - 官方人均缺失时，可按明确标注人数的套餐估算人均，例如双人餐 200 元按 100 元/人计算
@@ -74,6 +75,9 @@ python "$env:USERPROFILE\.codex\skills\.system\skill-installer\scripts\install-s
 python skills/meituan-safe/scripts/bootstrap.py
 skills/meituan-safe/.runtime/python/Scripts/python.exe -m unittest discover -s tests -v
 skills/meituan-safe/.runtime/python/Scripts/python.exe skills/meituan-safe/scripts/meituan_cli.py capabilities
+skills/meituan-safe/.runtime/python/Scripts/python.exe skills/meituan-safe/scripts/meituan_cli.py auth-check --location "北京望京地铁站" --keyword "汉堡"
+skills/meituan-safe/.runtime/python/Scripts/python.exe skills/meituan-safe/scripts/meituan_cli.py deal-login
+skills/meituan-safe/.runtime/python/Scripts/python.exe skills/meituan-safe/scripts/meituan_cli.py deal-login-status
 ```
 
 主要命令及参数可以通过以下方式查看：
@@ -87,6 +91,12 @@ skills/meituan-safe/.runtime/python/Scripts/python.exe skills/meituan-safe/scrip
 本项目只提供餐厅、团购、菜单和订单的只读查询，不支持领券、购物车变更、下单、再次购买、选择支付方式、支付、验证码绕过或无人值守购买。
 
 登录态保存在用户本机的独立 Chrome Profile 中，只向固定版本的本地运行时临时委派必要的认证信息。程序不会输出 Cookie、Token 或 storage state。除登录和人工验证外，浏览器均在后台无界面运行。
+
+外卖使用普通登录凭证；到店查询默认保留并使用已有的 Passport 授权，没有 Passport 时尝试共享登录。可以使用 `--auth-source shared` 明确测试共享凭证，或 `--auth-source passport` 明确使用 Passport。它们是可选择的凭证来源，不代表美团必须分别登录。只使用已授权的 Passport 查团购时，无需先登录外卖 H5。
+
+`status` 和 `login` 仅表示本地保存了凭证，不等于业务接口可用。`auth-check --location "北京望京地铁站" --keyword "汉堡"` 用同一共享凭证来源对两个业务各做一次只读搜索；要检查 `shared_login_verified` 和各项 `checks`，不能只看顶层 `ok`。旧凭证被拒绝时应先确认共享登录是否有效，再判断是否需要额外授权。403/429、风控或请求失败不应直接归为“登录过期”，也不会触发自动换凭证重试。
+
+可选团购授权使用可审计的标准 HTTPS + PKCE 两阶段流程，电脑端为美团 App 授权链接生成本地二维码，不打包参考项目的私有依赖、混淆签名组件及下单能力。Passport token 不进入命令行或 JSON 输出；Windows 上使用当前用户的 DPAPI 加密保存在本机，搜索时仅通过子进程环境临时委派。仅在使用该来源被拒绝后，才考虑 `deal-login --force`。电脑版网页登录二维码到外卖登录态的转换尚未通过实测，不作为正式能力发布。
 
 地点搜索结果是对美团返回的排序结果进行距离过滤，并不等同于完整地图普查；团购内容、价格和优惠是否可用应以实际门店页面及结算时展示为准。美团页面和同源接口可能变化，上游发生变化时可能需要更新固定版本与补丁。
 

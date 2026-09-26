@@ -443,7 +443,7 @@ new file mode 100644
 index 0000000..2b37653
 --- /dev/null
 +++ b/src/commands/deal.ts
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,76 @@
 +import { Command } from '@commander-js/extra-typings';
 +import { requireAuth } from '../auth/session.js';
 +import { format, formatError } from '../output/formatter.js';
@@ -498,7 +498,9 @@ index 0000000..2b37653
 +          formatError('Provide --address or --city-id.', { json: globalOpts.json });
 +          return;
 +        }
-+        const session = await requireAuth();
++        const session = process.env.MEITUAN_SAFE_DEAL_TOKEN
++          ? { token: process.env.MEITUAN_SAFE_DEAL_TOKEN, cookieString: '', userAgent: '' }
++          : await requireAuth();
 +        const result = await searchDeals(session, {
 +          keyword: opts.keyword,
 +          latitude: opts.lat,
@@ -607,6 +609,7 @@ index 0000000..b4bc727
 +  }
 +  if (!cityId) throw new Error('Meituan did not resolve a city ID');
 +
++  const token = process.env.MEITUAN_SAFE_DEAL_TOKEN || session.token;
 +  const body: Record<string, unknown> = {
 +    keyword: params.keyword,
 +    page: params.page ?? 1,
@@ -615,7 +618,7 @@ index 0000000..b4bc727
 +    userParamDTO: {
 +      lat: String(params.latitude),
 +      lng: String(params.longitude),
-+      token: session.token,
++      token,
 +      cityId,
 +      app: 216,
 +      platform: 1,
@@ -625,7 +628,7 @@ index 0000000..b4bc727
 +  if (params.queryId) body.queryId = params.queryId;
 +  if (params.requestId) body.requestId = params.requestId;
 +
-+  const result = await postJson(DEAL_SEARCH_URL, body, session.token);
++  const result = await postJson(DEAL_SEARCH_URL, body, token);
 +  if (result.code !== 200 || !result.success || !result.data) {
 +    throw new Error(`Deal search failed: ${result.message || String(result.code)}`);
 +  }
@@ -699,3 +702,141 @@ index 0000000..2fddb74
 +    expect(fetchMock.mock.calls[0]![1]!.headers).toHaveProperty('token', 'secret-token');
 +  });
 +});
+diff --git a/src/commands/deal.test.ts b/src/commands/deal.test.ts
+new file mode 100644
+index 0000000..066b1b9
+--- /dev/null
++++ b/src/commands/deal.test.ts
+@@ -0,0 +1,34 @@
++import { afterEach, describe, expect, it, vi } from 'vitest';
++import { Command } from '@commander-js/extra-typings';
++import { requireAuth } from '../auth/session.js';
++import { searchDeals } from '../services/deal.js';
++import { buildDealCommand } from './deal.js';
++
++vi.mock('../auth/session.js', () => ({ requireAuth: vi.fn() }));
++vi.mock('../services/deal.js', () => ({ resolveDealLocation: vi.fn(), searchDeals: vi.fn() }));
++vi.mock('../output/formatter.js', () => ({ format: vi.fn(), formatError: vi.fn() }));
++
++afterEach(() => {
++  vi.unstubAllEnvs();
++  vi.clearAllMocks();
++});
++
++describe('deal command', () => {
++  it('uses Passport authorization without requiring an H5 session', async () => {
++    vi.stubEnv('MEITUAN_SAFE_DEAL_TOKEN', 'passport-token');
++    vi.mocked(searchDeals).mockResolvedValue({
++      products: [], isLastPage: true, queryId: '', requestId: '', cityId: '1',
++    });
++    const program = new Command('mt').addCommand(buildDealCommand());
++
++    await program.parseAsync([
++      'deal', 'search', '--keyword', '烧烤', '--lat', '40', '--lng', '116.47', '--city-id', '1',
++    ], { from: 'user' });
++
++    expect(requireAuth).not.toHaveBeenCalled();
++    expect(searchDeals).toHaveBeenCalledWith(
++      { token: 'passport-token', cookieString: '', userAgent: '' },
++      expect.objectContaining({ keyword: '烧烤', cityId: '1' }),
++    );
++  });
++});
+diff --git a/src/auth/login.test.ts b/src/auth/login.test.ts
+index b7961b3..bd3b054 100644
+--- a/src/auth/login.test.ts
++++ b/src/auth/login.test.ts
+@@ -94,4 +94,22 @@ describe('storageState invalidation on login', () => {
+       '/mock-home/.config/meituan-cli/browser-state/storage-state.json',
+     );
+   });
++
++  it('cookie login replaces the old standalone token', async () => {
++    const { loginWithToken, loginWithCookie } = await import('./login.js');
++    const { loadToken, loadCookie } = await import('./credential.js');
++    loginWithToken('old-token');
++    loginWithCookie('token=new-token; userId=123');
++    expect(loadToken()).toBeNull();
++    expect(loadCookie()).toBe('token=new-token; userId=123');
++  });
++
++  it('token login replaces the old cookie session', async () => {
++    const { loginWithToken, loginWithCookie } = await import('./login.js');
++    const { loadToken, loadCookie } = await import('./credential.js');
++    loginWithCookie('token=old-token; userId=123');
++    loginWithToken('new-token');
++    expect(loadToken()).toBe('new-token');
++    expect(loadCookie()).toBeNull();
++  });
+ });
+diff --git a/src/auth/login.ts b/src/auth/login.ts
+index edde015..7971268 100644
+--- a/src/auth/login.ts
++++ b/src/auth/login.ts
+@@ -16,12 +16,14 @@ function invalidateBrowserState(): void {
+
+ export function loginWithToken(token: string): { success: boolean; message: string } {
+   saveToken(token);
++  deleteCookie();
+   invalidateBrowserState();
+   return { success: true, message: 'Token saved. Run: mt auth whoami to verify.' };
+ }
+
+ export function loginWithCookie(cookie: string): { success: boolean; message: string } {
+   saveCookie(cookie);
++  deleteToken();
+   invalidateBrowserState();
+   return { success: true, message: 'Cookie saved. Run: mt auth whoami to verify.' };
+ }
+diff --git a/src/auth/session.test.ts b/src/auth/session.test.ts
+index dcd4d54..3e93741 100644
+--- a/src/auth/session.test.ts
++++ b/src/auth/session.test.ts
+@@ -80,4 +80,24 @@ describe('requireAuth', () => {
+     expect(session.token).toBe('abc');
+     expect(session.cookieString).toBe('token=abc; userId=123');
+   });
++
++  it('uses the cookie token for both businesses even if a legacy token remains', async () => {
++    const credentials = await import('./credential.js');
++    vi.mocked(credentials.loadToken).mockReturnValue('stale-token');
++    vi.mocked(credentials.loadCookie).mockReturnValue('token=fresh-token; userId=123');
++    const { requireAuth } = await import('./session.js');
++    const session = await requireAuth();
++    expect(session.token).toBe('fresh-token');
++    expect(session.cookieString).toContain(`token=${session.token}`);
++  });
++
++  it('extracts the same sanitized token that is sent in the cookie', async () => {
++    const credentials = await import('./credential.js');
++    vi.mocked(credentials.loadToken).mockReturnValue('stale-token');
++    vi.mocked(credentials.loadCookie).mockReturnValue('token=fresh-\n token; userId=123');
++    const { requireAuth } = await import('./session.js');
++    const session = await requireAuth();
++    expect(session.token).toBe('fresh-token');
++    expect(session.cookieString).toContain(`token=${session.token}`);
++  });
+ });
+diff --git a/src/auth/session.ts b/src/auth/session.ts
+index b8006a6..ab5987f 100644
+--- a/src/auth/session.ts
++++ b/src/auth/session.ts
+@@ -10,14 +10,14 @@ export async function requireAuth(): Promise<Session> {
+   if (!token && !cookie) {
+     throw new AuthError('Not logged in. Run: mt auth login');
+   }
+-  // Extract token from cookie string if no standalone token stored
+-  const effectiveToken = token ?? extractTokenFromCookie(cookie!);
++  // Keep token-based and cookie-based requests on the same stored session.
++  const effectiveToken = (cookie ? extractTokenFromCookie(sanitizeCookie(cookie)) : undefined) ?? token ?? 'cookie-auth';
+   return buildSession(effectiveToken, cookie);
+ }
+
+-function extractTokenFromCookie(cookie: string): string {
++function extractTokenFromCookie(cookie: string): string | undefined {
+   const match = cookie.match(/(?:^|;\s*)token=([^;]+)/);
+-  return match?.[1] ?? 'cookie-auth';
++  return match?.[1];
+ }
+
+ function sanitizeCookie(cookie: string): string {
